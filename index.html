@@ -967,11 +967,8 @@
         }
 
         // ── TRINITY OS → Deriv Terminal pair bridge ──
-        window.addEventListener('message', function(e) {
-            var pair = e.data && e.data.trinityOS_pair;
-            if (!pair) return;
-
-            // Map display names to Deriv API symbols
+        // Shared symbol resolution used by both postMessage and localStorage listeners
+        function resolveDerivSymbol(pair) {
             var reverseMap = {
                 'V10': '1HZ10V', 'V15': '1HZ15V', 'V25': '1HZ25V',
                 'V30': '1HZ30V', 'V50': '1HZ50V', 'V75': '1HZ75V',
@@ -983,20 +980,34 @@
                 '30V': '1HZ30V', '50V': '1HZ50V', '75V': '1HZ75V',
                 '90V': '1HZ90V', '100V': '1HZ100V'
             };
-
-            // Try direct map first, then try prefixing with 1HZ
             var apiSymbol = reverseMap[pair] || reverseMap[pair.toUpperCase()];
             if (!apiSymbol) {
-                // fallback: strip non-alphanumeric, attempt to match by number
                 var num = pair.replace(/[^0-9]/g, '');
                 if (num) apiSymbol = '1HZ' + num + 'V';
             }
+            return apiSymbol || null;
+        }
 
+        function applyPairSelection(pair) {
+            var apiSymbol = resolveDerivSymbol(pair);
             if (!apiSymbol) return;
-
-            // Click the matching quick-pair button
             var btn = document.querySelector('.quick-pair-btn[data-val="' + apiSymbol + '"]');
             if (btn) btn.click();
+        }
+
+        // Listener 1: postMessage (works in Electron webview context)
+        window.addEventListener('message', function(e) {
+            var pair = e.data && e.data.trinityOS_pair;
+            if (!pair) return;
+            applyPairSelection(pair);
+        });
+
+        // Listener 2: localStorage storage event (works cross-tab on GitHub Pages)
+        // FFT.html writes: localStorage.setItem('trinityOS_selected_pair', cleanPair)
+        // This fires in all OTHER same-origin tabs instantly — no polling needed.
+        window.addEventListener('storage', function(e) {
+            if (e.key !== 'trinityOS_selected_pair' || !e.newValue) return;
+            applyPairSelection(e.newValue.trim());
         });
     </script>
     </body>
