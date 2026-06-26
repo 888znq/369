@@ -279,9 +279,9 @@
     <script>
         const DERIV_APP_ID = "33wuhc3RztQ6f2rwZijoR";
                         const DERIV_API_TOKEN = "pat_af26ff5010877e4f07516004ea3f8ae9c6ab091f9b251c3d3c8384d372e5da57";
-                        // Deriv requires numeric App IDs. Fallback to 1089 (default) if alphanumeric is provided.
-                        const safeAppId = /^\d+$/.test(DERIV_APP_ID) ? DERIV_APP_ID : 1089;
-                        const DERIV_WS = `wss://ws.derivws.com/websockets/v3?app_id=${safeAppId}`;
+                        const DERIV_API_BASE = "https://api.derivws.com";
+                        // Switch to ROT91856104 for the real account once it's funded and you're ready to go live.
+                        const DERIV_ACCOUNT_ID = "DOT93156972";
                         
                         let ws;
                 let currentPair = "1HZ100V";
@@ -602,129 +602,153 @@
         }
 
 
-        // --- WEBSOCKET ENGINE ---
-        function connect() {
-            ws = new WebSocket(DERIV_WS);
-
-            ws.onopen = () => {
-                            connStatus.innerText = 'ONLINE';
-                            connStatus.style.background = '#0ecb81';
-                            ws.send(JSON.stringify({ authorize: DERIV_API_TOKEN }));
-                        };
-
-            ws.onmessage = (msg) => {
-                            const data = JSON.parse(msg.data);
-            
-                            // ENHANCED ERROR HANDLING FOR FAILED TRADES / BAD TOKENS
-                                            if (data.error) {
-                                                console.error("API Error:", data.error.message);
-                                                
-                                                // Intercept and silently ignore the background "Already Subscribed" warning
-                                                if (data.error.code === 'AlreadySubscribed' || data.error.message.includes('already subscribed')) {
-                                                    return; 
-                                                }
-            
-                                                // Ignore rate limit popups for history ticks since we auto-recover
-                                                if (data.error.code === 'RateLimit' || data.error.message.includes('rate limit')) {
-                                                    console.warn("Deriv API Rate Limit hit - request ignored.");
-                                                    return;
-                                                }
-                            
-                                                if (data.error.code === 'InvalidToken' || data.error.code === 'AuthorizationRequired') {
-                                                    alert("⚠️ API ERROR: Your Token does not have 'Trade' permissions.\n\nPlease go to Deriv -> Security -> API Tokens and create a new token with the 'Trade' box checked.");
-                                                } else if (data.error.code === 'InvalidContractParameters') {
-                                                    alert("⚠️ PARAMETER ERROR: Trading is not available for this Symbol at the selected duration.\n\nTry changing Duration to Minutes (or test on Synthetic Indices).");
-                                                } else {
-                                                    alert("⚠️ Deriv API Error: " + data.error.message);
-                                                                        }
-                                                                        return;
-                                                                    }
-                                        
-                                                        if (data.authorize) {
-                                                                            ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-                                                                            // Initialize canvas dimensions before fetching data
-                                                                            resizeCanvas();
-                                                                            // Lazy Load: Fetch ONLY the active pair to prevent rate limit blocks
-                                                                            fetchPairData(currentPair);
-                                                                        }
-                                                        
-                                                                        if (data.balance) {
-                                                                    balanceDisplay.innerText = `$${data.balance.balance.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
-                                                                }
-                
-                                if (data.history) {
-                                    const symbol = data.echo_req.ticks_history;
-                                    processHistory(symbol, data.history.times, data.history.prices);
-                                    if (symbol === currentPair) {
-                                        loadingText.style.display = 'none'; // Hide loading text once data arrives
-                                        drawChart();
-                                    }
+        // --- WEBSOCKET ENGINE (new Deriv API: REST OTP + msg_type dispatch) ---
+                async function connect() {
+                    connStatus.innerText = 'CONNECTING...';
+                    connStatus.style.background = '#888';
+        
+                    let wsUrl;
+                    try {
+                        const otpRes = await fetch(
+                            `${DERIV_API_BASE}/trading/v1/options/accounts/${DERIV_ACCOUNT_ID}/otp`,
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': `Bearer ${DERIV_API_TOKEN}`,
+                                    'Deriv-App-ID': DERIV_APP_ID
                                 }
-                
-                                if (data.tick) {
-                                                                    const symbol = data.tick.symbol;
-                                                                    tickSubscriptions[symbol] = data.tick.id;
-                                                                    processLiveTick(symbol, data.tick.epoch, data.tick.quote);
-                                                                }
-                                
-                                                // Handle proposal response → fire the real buy at the quoted ask price
-                                                                                                if (data.proposal && data.req_id && window._pendingTradeReqs && window._pendingTradeReqs[data.req_id]) {
-                                                                                                    ws.send(JSON.stringify({
-                                                                                                        buy: data.proposal.id,
-                                                                                                        price: data.proposal.ask_price,
-                                                                                                        req_id: data.req_id
-                                                                                                    }));
-                                                                                                }
-                                
-                                                // Handle Trades
-                                                                                                if (data.buy) {
-                                                                    const cid = data.buy.contract_id;
-                                                                    const reqMeta = (data.echo_req && data.echo_req.req_id && window._pendingTradeReqs) ? window._pendingTradeReqs[data.echo_req.req_id] : null;
-                                                                    const type = (reqMeta && reqMeta.type) || (data.echo_req && data.echo_req.parameters && data.echo_req.parameters.contract_type) || 'CALL';
-                                                                    const duration = (window._lastTradeExpirySecs) || (data.echo_req && data.echo_req.parameters && data.echo_req.parameters.duration) || 0;
-                                                                    const currentServerTime = Math.floor(Date.now() / 1000) + serverTimeOffset;
-
-                    const t = { 
-                        id: cid, 
-                        type: type,
-                        stake: data.buy.buy_price, 
-                        status: 'OPEN', 
-                        profit: 0,
-                        expiry: currentServerTime + duration, // Initial estimate before server confirms exact time
-                        entry_spot: null, 
-                        entry_time: currentServerTime // Fallback entry time
-                    };
-                    tradeHistory.push(t);
-                    ws.send(JSON.stringify({ proposal_open_contract: 1, contract_id: cid, subscribe: 1 }));
-                    updateTradeUI();
-                    
-                    // Silent logging instead of intrusive alert pop-up
-                    console.log(`✅ Trade Executed: ID ${cid} | Type ${type} | Price $${data.buy.buy_price}`);
-                }
-
-                if (data.proposal_open_contract) {
-                    const c = data.proposal_open_contract;
-                    const t = tradeHistory.find(x => x.id === c.contract_id);
-                    if (t) {
-                        t.profit = c.profit;
-                        t.status = c.is_sold ? (c.profit > 0 ? 'WON' : 'LOST') : 'OPEN';
-                        
-                        // Capture exact exact server entry & expiry for precise charting
-                        if (c.date_expiry) t.expiry = c.date_expiry; 
-                        if (c.date_start) t.entry_time = c.date_start; 
-                        if (c.entry_tick) t.entry_spot = c.entry_tick; 
-
-                        updateTradeUI();
+                            }
+                        );
+                        if (!otpRes.ok) {
+                            console.error("OTP request failed:", otpRes.status);
+                            connStatus.innerText = 'OFFLINE';
+                            connStatus.style.background = '#f6465d';
+                            setTimeout(connect, 5000);
+                            return;
+                        }
+                        const otpData = await otpRes.json();
+                        wsUrl = otpData.data.url;
+                    } catch (e) {
+                        console.error("OTP request error:", e);
+                        connStatus.innerText = 'OFFLINE';
+                        connStatus.style.background = '#f6465d';
+                        setTimeout(connect, 5000);
+                        return;
                     }
+        
+                    ws = new WebSocket(wsUrl);
+        
+                    ws.onopen = () => {
+                        connStatus.innerText = 'ONLINE';
+                        connStatus.style.background = '#0ecb81';
+                        ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: 1 }));
+                        resizeCanvas();
+                        fetchPairData(currentPair);
+                    };
+        
+                    ws.onmessage = (msg) => {
+                                    const data = JSON.parse(msg.data);
+        
+                                    // ENHANCED ERROR HANDLING FOR FAILED TRADES / BAD TOKENS
+                                                    if (data.error) {
+                                                        console.error("API Error:", data.error.message);
+        
+                                                        if (data.error.code === 'AlreadySubscribed' || (data.error.message && data.error.message.includes('already subscribed'))) {
+                                                            return;
+                                                        }
+        
+                                                        if (data.error.code === 'RateLimit' || (data.error.message && data.error.message.includes('rate limit'))) {
+                                                            console.warn("Deriv API Rate Limit hit - request ignored.");
+                                                            return;
+                                                        }
+        
+                                                        if (data.error.code === 'InvalidContractParameters') {
+                                                            alert("⚠️ PARAMETER ERROR: Trading is not available for this Symbol at the selected duration.\n\nTry changing Duration to Minutes (or test on Synthetic Indices).");
+                                                        } else {
+                                                            alert("⚠️ Deriv API Error: " + data.error.message);
+                                                        }
+                                                        return;
+                                                    }
+        
+                                                    // New API dispatches by msg_type rather than by checking which key is present
+                                                    const msgType = data.msg_type;
+        
+                                                    if (msgType === 'balance') {
+                                                        balanceDisplay.innerText = `$${data.balance.balance.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+                                                    }
+        
+                                                    if (msgType === 'history' && data.history) {
+                                                                                                    // echo_req is no longer guaranteed in the new API, so fall back to
+                                                                                                    // the symbol we know we last requested rather than reading it off the echo.
+                                                                                                    const symbol = (data.echo_req && data.echo_req.ticks_history) || window._lastFetchedSymbol || currentPair;
+                                                                                                    processHistory(symbol, data.history.times, data.history.prices);
+                                                                                                    if (symbol === currentPair) {
+                                                                                                        loadingText.style.display = 'none';
+                                                                                                        drawChart();
+                                                                                                    }
+                                                                                                }
+        
+                                                    if (msgType === 'tick') {
+                                                        const symbol = data.tick.symbol;
+                                                        tickSubscriptions[symbol] = data.tick.id;
+                                                        processLiveTick(symbol, data.tick.epoch, data.tick.quote);
+                                                    }
+        
+                                                    // Handle proposal response → fire the real buy at the quoted ask price
+                                                    if (msgType === 'proposal' && data.req_id && window._pendingTradeReqs && window._pendingTradeReqs[data.req_id]) {
+                                                        ws.send(JSON.stringify({
+                                                            buy: data.proposal.id,
+                                                            price: data.proposal.ask_price,
+                                                            req_id: data.req_id
+                                                        }));
+                                                    }
+        
+                                                    // Handle Trades
+                                                    if (msgType === 'buy') {
+                                                        const cid = data.buy.contract_id;
+                                                        const reqMeta = (data.echo_req && data.echo_req.req_id && window._pendingTradeReqs) ? window._pendingTradeReqs[data.echo_req.req_id] : null;
+                                                        const type = (reqMeta && reqMeta.type) || 'CALL';
+                                                        const duration = window._lastTradeExpirySecs || 0;
+                                                        const currentServerTime = Math.floor(Date.now() / 1000) + serverTimeOffset;
+        
+                                                        if (reqMeta && data.echo_req.req_id) delete window._pendingTradeReqs[data.echo_req.req_id];
+        
+                                                        const t = {
+                                                            id: cid,
+                                                            type: type,
+                                                            stake: data.buy.buy_price,
+                                                            status: 'OPEN',
+                                                            profit: 0,
+                                                            expiry: currentServerTime + duration,
+                                                            entry_spot: null,
+                                                            entry_time: currentServerTime
+                                                        };
+                                                        tradeHistory.push(t);
+                                                        ws.send(JSON.stringify({ proposal_open_contract: 1, contract_id: cid, subscribe: 1, req_id: 99 }));
+                                                        updateTradeUI();
+                                                        console.log(`✅ Trade Executed: ID ${cid} | Type ${type} | Price $${data.buy.buy_price}`);
+                                                    }
+        
+                                                    if (msgType === 'proposal_open_contract') {
+                                                        const c = data.proposal_open_contract;
+                                                        const t = tradeHistory.find(x => x.id === c.contract_id);
+                                                        if (t) {
+                                                            t.profit = c.profit;
+                                                            t.status = c.is_sold ? (c.profit > 0 ? 'WON' : 'LOST') : 'OPEN';
+                                                            if (c.date_expiry) t.expiry = c.date_expiry;
+                                                            if (c.date_start) t.entry_time = c.date_start;
+                                                            if (c.entry_tick) t.entry_spot = c.entry_tick;
+                                                            updateTradeUI();
+                                                        }
+                                                    }
+                                                };
+        
+                    ws.onclose = () => {
+                        connStatus.innerText = 'OFFLINE';
+                        connStatus.style.background = '#f6465d';
+                        setTimeout(connect, 3000);
+                    };
                 }
-            };
-
-            ws.onclose = () => {
-                connStatus.innerText = 'OFFLINE';
-                connStatus.style.background = '#f6465d';
-                setTimeout(connect, 3000); 
-            };
-        }
 
         // --- TRADES UI MODAL ---
                 function updateTradeUI() {
@@ -767,21 +791,22 @@
 
         // --- BULLETPROOF CHART DATA PROCESSORS ---
                 function fetchPairData(symbol) {
-                    marketData[symbol] = []; 
-                    
-                    if (tickSubscriptions[symbol]) {
-                        ws.send(JSON.stringify({ forget: tickSubscriptions[symbol] }));
-                        delete tickSubscriptions[symbol];
-                    }
-        
-                    ws.send(JSON.stringify({
-                        ticks_history: symbol,
-                        end: "latest",
-                        count: 2500, // Adjusted to handle background streaming safely for multiple pairs
-                        style: "ticks",
-                        subscribe: 1
-                    }));
-                }
+                                    marketData[symbol] = [];
+                                    window._lastFetchedSymbol = symbol;
+                
+                                    if (tickSubscriptions[symbol]) {
+                                        ws.send(JSON.stringify({ forget: tickSubscriptions[symbol] }));
+                                        delete tickSubscriptions[symbol];
+                                    }
+                
+                                    ws.send(JSON.stringify({
+                                        ticks_history: symbol,
+                                        end: "latest",
+                                        count: 2500,
+                                        style: "ticks",
+                                        subscribe: 1
+                                    }));
+                                }
         
                 function switchPairView(newPair) {
                     currentPair = newPair;
